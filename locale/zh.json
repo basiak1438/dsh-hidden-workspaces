@@ -1,0 +1,15 @@
+{
+  "meta": {
+    "title": "工作区隐身与检索隔离",
+    "description": "方便地隐藏指定工作区。隐藏后未手动唤出前，DSH 自动在侧边栏、全局搜索、会话列表及历史检索中完全隔离排除其内容。"
+  },
+  "action": {
+    "buttonLabel": "隐藏工作区",
+    "manageTitle": "工作区隐身与检索管理",
+    "hideCurrent": "隐匿当前工作区",
+    "summon": "手动唤出",
+    "reshide": "重新隐匿",
+    "unhide": "解除隐匿",
+    "refresh": "刷新视图"
+  }
+}

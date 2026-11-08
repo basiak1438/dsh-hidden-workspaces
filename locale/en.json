@@ -1,0 +1,15 @@
+{
+  "meta": {
+    "title": "Hidden Workspaces & Search Shield",
+    "description": "Conveniently hide workspaces. Once hidden, DSH automatically excludes and shields their contents from sidebar, global session search, session lists, and Agent queries until manually summoned."
+  },
+  "action": {
+    "buttonLabel": "Hidden Workspaces",
+    "manageTitle": "Hidden Workspaces & Search Shield Manager",
+    "hideCurrent": "Hide Current Workspace",
+    "summon": "Summon",
+    "reshide": "Shield Again",
+    "unhide": "Unhide",
+    "refresh": "Refresh View"
+  }
+}
