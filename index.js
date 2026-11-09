@@ -45,6 +45,26 @@ export function apply(ctx) {
   let storedConfig = loadStoredConfig();
   let originalWorkspaceList = null;
   const summonedIds = new Set();
+  const sessionCwdMap = new Map(); // sessionId -> canonicalCwd
+
+  async function refreshSessionCwdMap() {
+    try {
+      const persistence = ctx.sessionPersistence || ctx.get('sessionPersistence');
+      if (persistence && typeof persistence.list === 'function') {
+        const snapshots = await persistence.list();
+        for (const snap of snapshots) {
+          if (snap.header?.id && snap.header?.cwd) {
+            sessionCwdMap.set(snap.header.id, snap.header.cwd);
+          }
+        }
+      }
+    } catch (err) {
+      logger.error('Failed to refresh session cwd map:', err);
+    }
+  }
+
+  // 初始化加载全量会话路径
+  refreshSessionCwdMap();
 
   function isEffectivelyHidden(workspaceId, workspacePath) {
     const wsIdStr = String(workspaceId);
@@ -65,8 +85,9 @@ export function apply(ctx) {
       const reg = ctx.workspaceRegistry;
       if (reg) {
         const entity = reg.get ? reg.get(workspaceId) : (reg.entities?.get ? reg.entities.get(workspaceId) : null);
-        if (entity && Array.isArray(entity.sessionIds)) {
-          return entity.sessionIds;
+        const sIds = entity?.record?.sessionIds || entity?.sessionIds;
+        if (Array.isArray(sIds)) {
+          return sIds;
         }
       }
     } catch (_) {}
@@ -78,30 +99,63 @@ export function apply(ctx) {
     const activeHidden = getActiveHiddenEntries();
     if (activeHidden.length === 0) return false;
 
+    // 1. 检查工作区实体内记录的 sessionIds
     try {
       const reg = ctx.workspaceRegistry;
       if (reg) {
         for (const hidden of activeHidden) {
           const entity = reg.get ? reg.get(hidden.id) : (reg.entities?.get ? reg.entities.get(hidden.id) : null);
-          if (entity && Array.isArray(entity.sessionIds) && entity.sessionIds.includes(sessionId)) {
+          const sIds = entity?.record?.sessionIds || entity?.sessionIds;
+          if (Array.isArray(sIds) && sIds.includes(sessionId)) {
             return true;
-          }
-          if (reg.sessionPaths && reg.sessionPaths.get) {
-            const sessPath = reg.sessionPaths.get(sessionId);
-            if (sessPath && hidden.path && path.normalize(sessPath).toLowerCase().startsWith(path.normalize(hidden.path).toLowerCase())) {
-              return true;
-            }
           }
         }
       }
     } catch (_) {}
 
+    // 2. 检查会话物理工作目录 (sessionCwdMap)
+    const cwd = sessionCwdMap.get(sessionId);
+    if (cwd) {
+      const normCwd = path.normalize(cwd).toLowerCase();
+      for (const hidden of activeHidden) {
+        if (!hidden.path) continue;
+        const normWsPath = path.normalize(hidden.path).toLowerCase();
+        if (normCwd === normWsPath || normCwd.startsWith(normWsPath + path.sep)) {
+          return true;
+        }
+      }
+    }
+
     return false;
   }
 
+  function getAllHiddenSessionIds() {
+    const hiddenSet = new Set();
+    const activeHidden = getActiveHiddenEntries();
+    if (activeHidden.length === 0) return [];
+
+    const reg = ctx.workspaceRegistry;
+    for (const hidden of activeHidden) {
+      const entity = reg?.get ? reg.get(hidden.id) : (reg?.entities?.get ? reg.entities.get(hidden.id) : null);
+      const sIds = entity?.record?.sessionIds || entity?.sessionIds;
+      if (Array.isArray(sIds)) {
+        for (const id of sIds) hiddenSet.add(id);
+      }
+      if (hidden.path) {
+        const normWsPath = path.normalize(hidden.path).toLowerCase();
+        for (const [sId, cwd] of sessionCwdMap.entries()) {
+          const normCwd = path.normalize(cwd).toLowerCase();
+          if (normCwd === normWsPath || normCwd.startsWith(normWsPath + path.sep)) {
+            hiddenSet.add(sId);
+          }
+        }
+      }
+    }
+    return Array.from(hiddenSet);
+  }
+
   /**
-   * 核心广播：严格通过 ctx.workspaceController.feed.baseline() 获取当前合法的工作区投影，
-   * 并利用 feed.publish({ type: 'replace' }) 向前端实时广播，侧边栏瞬间响应。
+   * 核心广播：向连接的客户端同步最新工作区投影
    */
   function syncToClient() {
     try {
@@ -120,9 +174,7 @@ export function apply(ctx) {
   }
 
   /**
-   * 自动归拢游离会话：
-   * 遍历所有历史会话，根据会话的工作目录（cwd）精准匹配所属工作区，
-   * 将脱离工作区名录的游离会话正式绑定（attachSession）至正确的工作区下。
+   * 自动归拢游离会话
    */
   async function reconcileStraySessions() {
     const result = { attached: 0, byWorkspace: {} };
@@ -135,6 +187,9 @@ export function apply(ctx) {
       if (persistence && typeof persistence.list === 'function') {
         const snapshots = await persistence.list();
         headers = snapshots.map(s => s.header).filter(Boolean);
+        for (const h of headers) {
+          if (h.id && h.cwd) sessionCwdMap.set(h.id, h.cwd);
+        }
       } else if (typeof reg.listStoredHeaders === 'function') {
         headers = await reg.listStoredHeaders();
       }
@@ -174,7 +229,6 @@ export function apply(ctx) {
                     if (rec.sessionIds.includes(header.id)) return rec;
                     return { ...rec, sessionIds: [header.id, ...rec.sessionIds] };
                   });
-                  reg.host?.rememberSessionPath?.(header.id, header.cwd);
                   currentSessionIds.add(header.id);
                   result.attached++;
                   result.byWorkspace[entity.title || wsId] = (result.byWorkspace[entity.title || wsId] || 0) + 1;
@@ -201,6 +255,7 @@ export function apply(ctx) {
     if (typeof ctx.sessionController.search === 'function') {
       const origSearch = ctx.sessionController.search;
       ctx.sessionController.search = async function(request, signal) {
+        if (sessionCwdMap.size === 0) await refreshSessionCwdMap();
         const res = await origSearch.call(this, request, signal);
         if (res && Array.isArray(res.items)) {
           return { ...res, items: res.items.filter(item => !isSessionHidden(item.sessionId)) };
@@ -214,6 +269,7 @@ export function apply(ctx) {
     if (typeof ctx.sessionController.list === 'function') {
       const origList = ctx.sessionController.list;
       ctx.sessionController.list = async function(request, signal) {
+        if (sessionCwdMap.size === 0) await refreshSessionCwdMap();
         const res = await origList.call(this, request, signal);
         if (res && Array.isArray(res.items)) {
           return { ...res, items: res.items.filter(item => !isSessionHidden(item.sessionId)) };
@@ -282,6 +338,7 @@ export function apply(ctx) {
         try {
           // GET /api/hidden-workspaces/list
           if (req.method === 'GET' && url.pathname === '/api/hidden-workspaces/list') {
+            if (sessionCwdMap.size === 0) await refreshSessionCwdMap();
             let allEntities = [];
             if (ctx.workspaceRegistry?.entities) {
               for (const entity of ctx.workspaceRegistry.entities.values()) {
@@ -307,9 +364,14 @@ export function apply(ctx) {
               isSummoned: summonedIds.has(w.id),
               hasPin: Boolean(w.pin)
             }));
+            const activeHiddenWsIds = getActiveHiddenEntries().map(w => w.id);
+            const hiddenSessionIds = getAllHiddenSessionIds();
+
             return sendJson(res, 200, {
               hidden: hiddenList,
-              available: allEntities.filter(e => !storedConfig.workspaces[e.id])
+              available: allEntities.filter(e => !storedConfig.workspaces[e.id]),
+              activeHiddenWsIds,
+              hiddenSessionIds
             });
           }
 
@@ -335,13 +397,19 @@ export function apply(ctx) {
               summonedIds.delete(wsIdStr);
               saveStoredConfig(storedConfig);
 
+              await refreshSessionCwdMap();
               const sessionIds = getSessionsForWorkspace(wsIdStr);
               for (const sId of sessionIds) {
                 try { ctx.emit('api-session/removed', sId); } catch (_) {}
               }
               syncToClient();
 
-              return sendJson(res, 200, { ok: true, message: 'Workspace shielded' });
+              return sendJson(res, 200, {
+                ok: true,
+                message: 'Workspace shielded',
+                activeHiddenWsIds: getActiveHiddenEntries().map(w => w.id),
+                hiddenSessionIds: getAllHiddenSessionIds()
+              });
             }
           }
 
@@ -355,8 +423,14 @@ export function apply(ctx) {
                 return sendJson(res, 403, { error: 'Invalid PIN' });
               }
               summonedIds.add(wsIdStr);
+              await refreshSessionCwdMap();
               syncToClient();
-              return sendJson(res, 200, { ok: true, message: 'Workspace summoned' });
+              return sendJson(res, 200, {
+                ok: true,
+                message: 'Workspace summoned',
+                activeHiddenWsIds: getActiveHiddenEntries().map(w => w.id),
+                hiddenSessionIds: getAllHiddenSessionIds()
+              });
             }
           }
 
@@ -366,12 +440,18 @@ export function apply(ctx) {
             if (workspaceId) {
               const wsIdStr = String(workspaceId);
               summonedIds.delete(wsIdStr);
+              await refreshSessionCwdMap();
               const sessionIds = getSessionsForWorkspace(wsIdStr);
               for (const sId of sessionIds) {
                 try { ctx.emit('api-session/removed', sId); } catch (_) {}
               }
               syncToClient();
-              return sendJson(res, 200, { ok: true, message: 'Workspace re-shielded' });
+              return sendJson(res, 200, {
+                ok: true,
+                message: 'Workspace re-shielded',
+                activeHiddenWsIds: getActiveHiddenEntries().map(w => w.id),
+                hiddenSessionIds: getAllHiddenSessionIds()
+              });
             }
           }
 
@@ -387,21 +467,39 @@ export function apply(ctx) {
               delete storedConfig.workspaces[wsIdStr];
               summonedIds.delete(wsIdStr);
               saveStoredConfig(storedConfig);
+              await refreshSessionCwdMap();
               syncToClient();
-              return sendJson(res, 200, { ok: true, message: 'Workspace unhidden' });
+              return sendJson(res, 200, {
+                ok: true,
+                message: 'Workspace unhidden',
+                activeHiddenWsIds: getActiveHiddenEntries().map(w => w.id),
+                hiddenSessionIds: getAllHiddenSessionIds()
+              });
             }
           }
 
           // POST /api/hidden-workspaces/sync
           if (req.method === 'POST' && url.pathname === '/api/hidden-workspaces/sync') {
+            await refreshSessionCwdMap();
             syncToClient();
-            return sendJson(res, 200, { ok: true, message: 'Synced to client' });
+            return sendJson(res, 200, {
+              ok: true,
+              message: 'Synced to client',
+              activeHiddenWsIds: getActiveHiddenEntries().map(w => w.id),
+              hiddenSessionIds: getAllHiddenSessionIds()
+            });
           }
 
           // POST /api/hidden-workspaces/reconcile
           if (req.method === 'POST' && url.pathname === '/api/hidden-workspaces/reconcile') {
             const reconcileResult = await reconcileStraySessions();
-            return sendJson(res, 200, { ok: true, message: 'Sessions reconciled', ...reconcileResult });
+            return sendJson(res, 200, {
+              ok: true,
+              message: 'Sessions reconciled',
+              ...reconcileResult,
+              activeHiddenWsIds: getActiveHiddenEntries().map(w => w.id),
+              hiddenSessionIds: getAllHiddenSessionIds()
+            });
           }
 
           sendJson(res, 404, { error: 'Not found' });

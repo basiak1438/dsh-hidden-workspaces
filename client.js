@@ -6,6 +6,60 @@ window.__ModuleLoader__.load({
 
     // 共享客户端上下文
     let clientCtx = null;
+    let cachedHiddenWsIds = [];
+    let cachedHiddenSessionIds = [];
+
+    // 动态全局 DOM 隐蔽护盾（双重蒸发保障）
+    function applyDomShield(hiddenWsIds = cachedHiddenWsIds, hiddenSessionIds = cachedHiddenSessionIds) {
+      cachedHiddenWsIds = hiddenWsIds || [];
+      cachedHiddenSessionIds = hiddenSessionIds || [];
+
+      const styleId = 'dsh-hidden-workspaces-shield';
+      let styleTag = document.getElementById(styleId);
+      if (!styleTag) {
+        styleTag = document.createElement('style');
+        styleTag.id = styleId;
+        document.head.appendChild(styleTag);
+      }
+
+      const rules = [];
+
+      // 1. 隐蔽工作区行、外层分组容器、以及展开/折叠溢出按钮
+      for (const wsId of cachedHiddenWsIds) {
+        rules.push(`div[data-row-key="workspace:${wsId}"] { display: none !important; }`);
+        rules.push(`div:has(> div[data-row-key="workspace:${wsId}"]) { display: none !important; }`);
+        rules.push(`button[data-row-key="overflow:${wsId}"] { display: none !important; }`);
+      }
+
+      // 2. 隐蔽受隔离的全部会话条目
+      for (const sessId of cachedHiddenSessionIds) {
+        rules.push(`div[data-row-key="session:${sessId}"] { display: none !important; }`);
+      }
+
+      styleTag.textContent = rules.join('\n');
+
+      // 3. 智能检测“未分组”：若“未分组”内所有子会话均被隔离隐匿，则将“未分组”标题行也彻底隐藏
+      try {
+        const ungroupedHeader = document.querySelector('div[data-row-key="workspace:"]');
+        if (ungroupedHeader) {
+          const parentGroup = ungroupedHeader.parentElement;
+          if (parentGroup) {
+            const allSessions = parentGroup.querySelectorAll('div[data-row-key^="session:"]');
+            if (allSessions.length > 0) {
+              const visibleCount = Array.from(allSessions).filter(el => {
+                const sId = el.getAttribute('data-row-key')?.replace('session:', '');
+                return !cachedHiddenSessionIds.includes(sId);
+              }).length;
+              if (visibleCount === 0) {
+                parentGroup.style.display = 'none';
+              } else {
+                parentGroup.style.display = '';
+              }
+            }
+          }
+        }
+      } catch (_) {}
+    }
 
     // 矢量图标：隐蔽之眼 / 隔离锁
     function ShieldEyeIcon(props) {
@@ -79,6 +133,9 @@ window.__ModuleLoader__.load({
           if (res.ok) {
             const json = await res.json();
             setData(json);
+            if (json.activeHiddenWsIds || json.hiddenSessionIds) {
+              applyDomShield(json.activeHiddenWsIds, json.hiddenSessionIds);
+            }
             if (json.available && json.available.length > 0) {
               setSelectedWsId(json.available[0].id);
             } else {
@@ -123,9 +180,12 @@ window.__ModuleLoader__.load({
       if (!isOpen) return null;
 
       // 辅助刷新本地客户端会话与工作区存储
-      const triggerClientRefresh = () => {
+      const triggerClientRefresh = (activeHiddenWsIds, hiddenSessionIds) => {
         try { clientCtx?.get?.('sessions')?.refresh?.(); } catch (_) {}
         try { clientCtx?.sessions?.refresh?.(); } catch (_) {}
+        if (activeHiddenWsIds || hiddenSessionIds) {
+          applyDomShield(activeHiddenWsIds, hiddenSessionIds);
+        }
       };
 
       // 隐藏工作区
@@ -140,9 +200,10 @@ window.__ModuleLoader__.load({
             body: JSON.stringify({ workspaceId: selectedWsId, pin: pinDraft.trim() || undefined })
           });
           if (res.ok) {
+            const json = await res.json();
             setPinDraft('');
             setMessage({ type: 'success', text: '工作区已成功隐匿！检索与侧边栏已全面隔离。' });
-            triggerClientRefresh();
+            triggerClientRefresh(json.activeHiddenWsIds, json.hiddenSessionIds);
             await fetchData();
           } else {
             const err = await res.json();
@@ -166,10 +227,11 @@ window.__ModuleLoader__.load({
             body: JSON.stringify({ workspaceId: wsId, pin })
           });
           if (res.ok) {
+            const json = await res.json();
             setPromptPinWsId(null);
             setInputPin('');
             setMessage({ type: 'success', text: '已手动唤出！该工作区已临时解除隔离。' });
-            triggerClientRefresh();
+            triggerClientRefresh(json.activeHiddenWsIds, json.hiddenSessionIds);
             await fetchData();
           } else {
             const err = await res.json();
@@ -193,8 +255,9 @@ window.__ModuleLoader__.load({
             body: JSON.stringify({ workspaceId: wsId })
           });
           if (res.ok) {
+            const json = await res.json();
             setMessage({ type: 'success', text: '已重新隐匿并生效隔离。' });
-            triggerClientRefresh();
+            triggerClientRefresh(json.activeHiddenWsIds, json.hiddenSessionIds);
             await fetchData();
           }
         } catch (err) {
@@ -215,10 +278,11 @@ window.__ModuleLoader__.load({
             body: JSON.stringify({ workspaceId: wsId, pin })
           });
           if (res.ok) {
+            const json = await res.json();
             setPromptPinWsId(null);
             setInputPin('');
             setMessage({ type: 'success', text: '已彻底解除隐匿，恢复为普通工作区。' });
-            triggerClientRefresh();
+            triggerClientRefresh(json.activeHiddenWsIds, json.hiddenSessionIds);
             await fetchData();
           } else {
             const err = await res.json();
@@ -624,7 +688,7 @@ window.__ModuleLoader__.load({
                     const res = await fetch('/api/hidden-workspaces/reconcile', { method: 'POST' });
                     if (res.ok) {
                       const json = await res.json();
-                      triggerClientRefresh();
+                      triggerClientRefresh(json.activeHiddenWsIds, json.hiddenSessionIds);
                       await fetchData();
                       if (json.attached > 0) {
                         const details = Object.entries(json.byWorkspace || {}).map(([k, v]) => `${k}: ${v}个`).join(', ');
@@ -656,9 +720,12 @@ window.__ModuleLoader__.load({
                 type: 'button',
                 onClick: async () => {
                   try {
-                    await fetch('/api/hidden-workspaces/sync', { method: 'POST' });
+                    const res = await fetch('/api/hidden-workspaces/sync', { method: 'POST' });
+                    if (res.ok) {
+                      const json = await res.json();
+                      triggerClientRefresh(json.activeHiddenWsIds, json.hiddenSessionIds);
+                    }
                   } catch (_) {}
-                  triggerClientRefresh();
                   await fetchData();
                   setMessage({ type: 'success', text: '已同步侧边栏与弹窗列表至最新状态！' });
                 },
@@ -698,6 +765,22 @@ window.__ModuleLoader__.load({
       inject: ['slots'],
       apply(ctx) {
         clientCtx = ctx;
+
+        // 启动时立即获取隐匿配置，秒级激活全局 DOM 护盾
+        fetch('/api/hidden-workspaces/list')
+          .then(res => res.json())
+          .then(data => {
+            if (data.activeHiddenWsIds || data.hiddenSessionIds) {
+              applyDomShield(data.activeHiddenWsIds, data.hiddenSessionIds);
+            }
+          })
+          .catch(() => {});
+
+        // 守护巡检定时器：确保路由切换或会话列表重绘时护盾依然严密生效
+        setInterval(() => {
+          applyDomShield();
+        }, 1200);
+
         // 1. 注册侧边栏底部唤出按钮
         ctx.slots.inject('sidebar.footer.action', () => ctx.slots.register({
           name: 'sidebar.footer.action',
