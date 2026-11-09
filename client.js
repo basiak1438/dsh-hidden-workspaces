@@ -599,12 +599,15 @@ window.__ModuleLoader__.load({
               backgroundColor: 'rgba(0,0,0,0.1)'
             }
           }, [
-            h('div', { style: { fontSize: '12px', color: 'var(--dsw-alias-label-secondary, #9aa0a6)' } }, '唤出或隐匿后，建议刷新页面以即时同步侧边栏与索引树'),
+            h('div', { style: { fontSize: '12px', color: 'var(--dsw-alias-label-secondary, #9aa0a6)' } }, '🛡️ 隐匿与唤出操作即刻生效，已自动同步全局搜索与检索隔离状态'),
             h('div', { style: { display: 'flex', gap: '10px' } }, [
               h('button', {
-                key: 'refresh-view-btn',
+                key: 'refresh-data-btn',
                 type: 'button',
-                onClick: () => window.location.reload(),
+                onClick: () => {
+                  fetchData();
+                  setMessage({ type: 'success', text: '列表数据已刷新至最新状态。' });
+                },
                 style: {
                   padding: '6px 14px',
                   borderRadius: '6px',
@@ -614,7 +617,7 @@ window.__ModuleLoader__.load({
                   fontSize: '13px',
                   cursor: 'pointer'
                 }
-              }, '🔄 刷新视图'),
+              }, '🔄 刷新列表'),
               h('button', {
                 key: 'done-btn',
                 type: 'button',
