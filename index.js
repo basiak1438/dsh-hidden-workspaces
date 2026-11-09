@@ -7,6 +7,7 @@ export const inject = [
   'workspaceRegistry',
   'workspaceController',
   'sessionController',
+  'sessionPersistence',
   'webServer',
   'commands',
   'tools'
@@ -116,6 +117,83 @@ export function apply(ctx) {
     } catch (err) {
       logger.error('Failed to sync workspace feed to client:', err);
     }
+  }
+
+  /**
+   * 自动归拢游离会话：
+   * 遍历所有历史会话，根据会话的工作目录（cwd）精准匹配所属工作区，
+   * 将脱离工作区名录的游离会话正式绑定（attachSession）至正确的工作区下。
+   */
+  async function reconcileStraySessions() {
+    const result = { attached: 0, byWorkspace: {} };
+    try {
+      const reg = ctx.workspaceRegistry;
+      const persistence = ctx.sessionPersistence || ctx.get('sessionPersistence');
+      if (!reg || !reg.entities) return result;
+
+      let headers = [];
+      if (persistence && typeof persistence.list === 'function') {
+        const snapshots = await persistence.list();
+        headers = snapshots.map(s => s.header).filter(Boolean);
+      } else if (typeof reg.listStoredHeaders === 'function') {
+        headers = await reg.listStoredHeaders();
+      }
+
+      if (headers.length === 0) return result;
+
+      for (const entity of reg.entities.values()) {
+        const wsId = String(entity.id);
+        const wsPath = entity.path;
+        if (!wsPath) continue;
+
+        let canonicalWsPath = wsPath;
+        try { canonicalWsPath = await fs.promises.realpath(wsPath); } catch (_) {}
+        const normWsPath = path.normalize(canonicalWsPath).toLowerCase();
+
+        const currentSessionIds = new Set(entity.record?.sessionIds || []);
+
+        for (const header of headers) {
+          if (!header.id || !header.cwd) continue;
+          if (currentSessionIds.has(header.id)) continue;
+
+          let canonicalCwd = header.cwd;
+          try { canonicalCwd = await fs.promises.realpath(header.cwd); } catch (_) {}
+          const normCwd = path.normalize(canonicalCwd).toLowerCase();
+
+          if (normCwd === normWsPath || normCwd.startsWith(normWsPath + path.sep)) {
+            try {
+              await entity.attachSession(header.id);
+              currentSessionIds.add(header.id);
+              result.attached++;
+              result.byWorkspace[entity.title || wsId] = (result.byWorkspace[entity.title || wsId] || 0) + 1;
+            } catch (_) {
+              try {
+                const table = reg.requireTable ? reg.requireTable() : reg.table;
+                if (table) {
+                  await table.update(entity.id, (rec) => {
+                    if (rec.sessionIds.includes(header.id)) return rec;
+                    return { ...rec, sessionIds: [header.id, ...rec.sessionIds] };
+                  });
+                  reg.host?.rememberSessionPath?.(header.id, header.cwd);
+                  currentSessionIds.add(header.id);
+                  result.attached++;
+                  result.byWorkspace[entity.title || wsId] = (result.byWorkspace[entity.title || wsId] || 0) + 1;
+                }
+              } catch (inner) {
+                logger.warn(`Failed to attach session ${header.id} to ${wsId}:`, inner);
+              }
+            }
+          }
+        }
+      }
+
+      if (result.attached > 0) {
+        syncToClient();
+      }
+    } catch (err) {
+      logger.error('Error in reconcileStraySessions:', err);
+    }
+    return result;
   }
 
   // 1. 拦截检索与列表
@@ -318,6 +396,12 @@ export function apply(ctx) {
           if (req.method === 'POST' && url.pathname === '/api/hidden-workspaces/sync') {
             syncToClient();
             return sendJson(res, 200, { ok: true, message: 'Synced to client' });
+          }
+
+          // POST /api/hidden-workspaces/reconcile
+          if (req.method === 'POST' && url.pathname === '/api/hidden-workspaces/reconcile') {
+            const reconcileResult = await reconcileStraySessions();
+            return sendJson(res, 200, { ok: true, message: 'Sessions reconciled', ...reconcileResult });
           }
 
           sendJson(res, 404, { error: 'Not found' });

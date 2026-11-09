@@ -615,6 +615,43 @@ window.__ModuleLoader__.load({
             h('div', { style: { fontSize: '12px', color: 'var(--dsw-alias-label-secondary, #9aa0a6)' } }, '🛡️ 隐匿与唤出操作即刻生效，侧边栏与全局搜索已实时同步'),
             h('div', { style: { display: 'flex', gap: '10px' } }, [
               h('button', {
+                key: 'reconcile-btn',
+                type: 'button',
+                onClick: async () => {
+                  setLoading(true);
+                  setMessage(null);
+                  try {
+                    const res = await fetch('/api/hidden-workspaces/reconcile', { method: 'POST' });
+                    if (res.ok) {
+                      const json = await res.json();
+                      triggerClientRefresh();
+                      await fetchData();
+                      if (json.attached > 0) {
+                        const details = Object.entries(json.byWorkspace || {}).map(([k, v]) => `${k}: ${v}个`).join(', ');
+                        setMessage({ type: 'success', text: `成功归拢 ${json.attached} 个游离会话 (${details}) 到对应工作区！` });
+                      } else {
+                        setMessage({ type: 'success', text: '检查完毕：所有会话均已归属于正确工作区，未分组中已无游离会话。' });
+                      }
+                    } else {
+                      setMessage({ type: 'error', text: '归拢请求失败' });
+                    }
+                  } catch (err) {
+                    setMessage({ type: 'error', text: '操作异常: ' + err.message });
+                  } finally {
+                    setLoading(false);
+                  }
+                },
+                style: {
+                  padding: '6px 14px',
+                  borderRadius: '6px',
+                  background: 'rgba(59, 130, 246, 0.15)',
+                  border: '1px solid rgba(59, 130, 246, 0.4)',
+                  color: '#60a5fa',
+                  fontSize: '13px',
+                  cursor: 'pointer'
+                }
+              }, '📥 归拢游离会话'),
+              h('button', {
                 key: 'refresh-data-btn',
                 type: 'button',
                 onClick: async () => {
