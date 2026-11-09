@@ -599,14 +599,17 @@ window.__ModuleLoader__.load({
               backgroundColor: 'rgba(0,0,0,0.1)'
             }
           }, [
-            h('div', { style: { fontSize: '12px', color: 'var(--dsw-alias-label-secondary, #9aa0a6)' } }, '🛡️ 隐匿与唤出操作即刻生效，已自动同步全局搜索与检索隔离状态'),
+            h('div', { style: { fontSize: '12px', color: 'var(--dsw-alias-label-secondary, #9aa0a6)' } }, '🛡️ 隐匿与唤出操作即刻生效，侧边栏与全局搜索已实时同步'),
             h('div', { style: { display: 'flex', gap: '10px' } }, [
               h('button', {
                 key: 'refresh-data-btn',
                 type: 'button',
-                onClick: () => {
-                  fetchData();
-                  setMessage({ type: 'success', text: '列表数据已刷新至最新状态。' });
+                onClick: async () => {
+                  try {
+                    await fetch('/api/hidden-workspaces/sync', { method: 'POST' });
+                  } catch (_) {}
+                  await fetchData();
+                  setMessage({ type: 'success', text: '已同步侧边栏与弹窗列表至最新状态！' });
                 },
                 style: {
                   padding: '6px 14px',

@@ -59,6 +59,19 @@ export function apply(ctx) {
     return Object.values(storedConfig.workspaces).filter(w => !summonedIds.has(w.id));
   }
 
+  function getSessionsForWorkspace(workspaceId) {
+    try {
+      const reg = ctx.workspaceRegistry;
+      if (reg) {
+        const entity = reg.get ? reg.get(workspaceId) : (reg.entities?.get ? reg.entities.get(workspaceId) : null);
+        if (entity && Array.isArray(entity.sessionIds)) {
+          return entity.sessionIds;
+        }
+      }
+    } catch (_) {}
+    return [];
+  }
+
   function isSessionHidden(sessionId) {
     if (!sessionId) return false;
     const activeHidden = getActiveHiddenEntries();
@@ -72,11 +85,36 @@ export function apply(ctx) {
           if (entity && Array.isArray(entity.sessionIds) && entity.sessionIds.includes(sessionId)) {
             return true;
           }
+          if (reg.sessionPaths && reg.sessionPaths.get) {
+            const sessPath = reg.sessionPaths.get(sessionId);
+            if (sessPath && hidden.path && path.normalize(sessPath).toLowerCase().startsWith(path.normalize(hidden.path).toLowerCase())) {
+              return true;
+            }
+          }
         }
       }
     } catch (_) {}
 
     return false;
+  }
+
+  /**
+   * 核心广播：向所有连接的前端推送最新的工作区 Baseline 与 Order，
+   * 触发 DSH 侧边栏立即剔除隐匿项或恢复显示项，彻底告别整页重载。
+   */
+  function syncToClient() {
+    try {
+      if (ctx.workspaceController?.feed && typeof ctx.workspaceController.feed.publish === 'function') {
+        const baseline = ctx.workspaceController.baseline();
+        ctx.workspaceController.feed.publish({ type: 'replace', value: baseline });
+        ctx.workspaceController.feed.publish({
+          type: 'order',
+          workspaceIds: baseline.items.map(w => w.workspaceId)
+        });
+      }
+    } catch (err) {
+      logger.error('Failed to sync workspace feed to client:', err);
+    }
   }
 
   // 1. 拦截检索与列表
@@ -90,6 +128,9 @@ export function apply(ctx) {
         }
         return res;
       };
+      ctx.effect(() => () => {
+        ctx.sessionController.search = origSearch;
+      }, 'hidden-workspaces: restore sessionController.search');
     }
     if (typeof ctx.sessionController.list === 'function') {
       const origList = ctx.sessionController.list;
@@ -100,15 +141,22 @@ export function apply(ctx) {
         }
         return res;
       };
+      ctx.effect(() => () => {
+        ctx.sessionController.list = origList;
+      }, 'hidden-workspaces: restore sessionController.list');
     }
   }
 
+  // 2. 拦截工作区列表
   if (ctx.workspaceRegistry && typeof ctx.workspaceRegistry.list === 'function') {
     originalWorkspaceList = ctx.workspaceRegistry.list;
     ctx.workspaceRegistry.list = function() {
       const all = originalWorkspaceList.call(this);
       return all.filter(ws => !isEffectivelyHidden(String(ws.id), ws.path));
     };
+    ctx.effect(() => () => {
+      ctx.workspaceRegistry.list = originalWorkspaceList;
+    }, 'hidden-workspaces: restore workspaceRegistry.list');
   }
 
   if (ctx.workspaceController && typeof ctx.workspaceController.baseline === 'function') {
@@ -123,9 +171,25 @@ export function apply(ctx) {
       }
       return base;
     };
+    ctx.effect(() => () => {
+      ctx.workspaceController.baseline = origBaseline;
+    }, 'hidden-workspaces: restore workspaceController.baseline');
   }
 
-  // 2. 注册 API 处理器
+  // 3. Agent 工具守卫
+  if (ctx.tools && typeof ctx.tools.guard === 'function') {
+    ctx.effect(() => ctx.tools.guard((exec) => {
+      if (exec.name === 'session_event_search' || exec.name === 'session_event_read') {
+        const targetId = exec.args?.session_id;
+        if (targetId && isSessionHidden(targetId)) {
+          return { kind: 'deny', reason: 'Session does not exist or is in a shielded workspace' };
+        }
+      }
+      return undefined;
+    }), 'hidden-workspaces: tool guard');
+  }
+
+  // 4. 注册 API 处理器
   if (ctx.webServer && typeof ctx.webServer.register === 'function') {
     function readJsonBody(req) {
       return new Promise((resolve) => {
@@ -144,65 +208,167 @@ export function apply(ctx) {
       res.end(JSON.stringify(data));
     }
 
-    ctx.webServer.register({
+    if (ctx.webServer.prefixes && typeof ctx.webServer.prefixes.delete === 'function') {
+      ctx.webServer.prefixes.delete('/api/hidden-workspaces');
+    }
+
+    ctx.effect(() => ctx.webServer.register({
       kind: 'prefix',
       path: '/api/hidden-workspaces',
       handler: async (req, res) => {
         const url = new URL(req.url, 'http://127.0.0.1');
         try {
-          // List
+          // GET /api/hidden-workspaces/list
           if (req.method === 'GET' && url.pathname === '/api/hidden-workspaces/list') {
             let allEntities = [];
-            if (originalWorkspaceList) {
+            if (originalWorkspaceList && ctx.workspaceRegistry) {
               allEntities = originalWorkspaceList.call(ctx.workspaceRegistry).map(entity => ({
                 id: String(entity.id),
                 title: entity.title,
                 path: entity.path
               }));
             }
+            if (allEntities.length === 0 && ctx.workspaceRegistry?.entities) {
+              for (const entity of ctx.workspaceRegistry.entities.values()) {
+                allEntities.push({
+                  id: String(entity.id),
+                  title: entity.title,
+                  path: entity.path
+                });
+              }
+            }
             const hiddenList = Object.values(storedConfig.workspaces).map(w => ({
-              id: w.id, title: w.title, path: w.path, isSummoned: summonedIds.has(w.id)
+              id: w.id,
+              title: w.title,
+              path: w.path,
+              hiddenAt: w.hiddenAt,
+              isSummoned: summonedIds.has(w.id),
+              hasPin: Boolean(w.pin)
             }));
-            return sendJson(res, 200, { hidden: hiddenList, available: allEntities.filter(e => !storedConfig.workspaces[e.id]) });
+            return sendJson(res, 200, {
+              hidden: hiddenList,
+              available: allEntities.filter(e => !storedConfig.workspaces[e.id])
+            });
           }
 
-          // Hide
+          // POST /api/hidden-workspaces/hide
           if (req.method === 'POST' && url.pathname === '/api/hidden-workspaces/hide') {
-            const { workspaceId } = await readJsonBody(req);
+            const { workspaceId, pin } = await readJsonBody(req);
             if (workspaceId) {
-              const entity = originalWorkspaceList.call(ctx.workspaceRegistry).find(w => w.id === workspaceId);
-              storedConfig.workspaces[workspaceId] = { id: workspaceId, title: entity?.title || workspaceId, path: entity?.path || '' };
+              const wsIdStr = String(workspaceId);
+              let entity = null;
+              if (originalWorkspaceList && ctx.workspaceRegistry) {
+                entity = originalWorkspaceList.call(ctx.workspaceRegistry).find(w => String(w.id) === wsIdStr);
+              }
+              if (!entity && ctx.workspaceRegistry?.get) {
+                entity = ctx.workspaceRegistry.get(wsIdStr);
+              }
+              storedConfig.workspaces[wsIdStr] = {
+                id: wsIdStr,
+                title: entity?.title || wsIdStr,
+                path: entity?.path || '',
+                hiddenAt: new Date().toISOString(),
+                pin: pin ? String(pin) : null
+              };
+              summonedIds.delete(wsIdStr);
               saveStoredConfig(storedConfig);
-              return sendJson(res, 200, { ok: true });
+
+              const sessionIds = getSessionsForWorkspace(wsIdStr);
+              for (const sId of sessionIds) {
+                try { ctx.emit('api-session/removed', sId); } catch (_) {}
+              }
+              syncToClient();
+
+              return sendJson(res, 200, { ok: true, message: 'Workspace shielded' });
             }
           }
 
-          // Summon
+          // POST /api/hidden-workspaces/summon
           if (req.method === 'POST' && url.pathname === '/api/hidden-workspaces/summon') {
-            const { workspaceId } = await readJsonBody(req);
+            const { workspaceId, pin } = await readJsonBody(req);
             if (workspaceId) {
-              summonedIds.add(workspaceId);
-              return sendJson(res, 200, { ok: true });
+              const wsIdStr = String(workspaceId);
+              const entry = storedConfig.workspaces[wsIdStr];
+              if (entry && entry.pin && entry.pin !== String(pin || '')) {
+                return sendJson(res, 403, { error: 'Invalid PIN' });
+              }
+              summonedIds.add(wsIdStr);
+              syncToClient();
+              return sendJson(res, 200, { ok: true, message: 'Workspace summoned' });
             }
           }
 
-          // Unhide
-          if (req.method === 'POST' && url.pathname === '/api/hidden-workspaces/unhide') {
+          // POST /api/hidden-workspaces/reshide
+          if (req.method === 'POST' && url.pathname === '/api/hidden-workspaces/reshide') {
             const { workspaceId } = await readJsonBody(req);
             if (workspaceId) {
-              delete storedConfig.workspaces[workspaceId];
-              summonedIds.delete(workspaceId);
-              saveStoredConfig(storedConfig);
-              return sendJson(res, 200, { ok: true });
+              const wsIdStr = String(workspaceId);
+              summonedIds.delete(wsIdStr);
+              const sessionIds = getSessionsForWorkspace(wsIdStr);
+              for (const sId of sessionIds) {
+                try { ctx.emit('api-session/removed', sId); } catch (_) {}
+              }
+              syncToClient();
+              return sendJson(res, 200, { ok: true, message: 'Workspace re-shielded' });
             }
+          }
+
+          // POST /api/hidden-workspaces/unhide
+          if (req.method === 'POST' && url.pathname === '/api/hidden-workspaces/unhide') {
+            const { workspaceId, pin } = await readJsonBody(req);
+            if (workspaceId) {
+              const wsIdStr = String(workspaceId);
+              const entry = storedConfig.workspaces[wsIdStr];
+              if (entry && entry.pin && entry.pin !== String(pin || '')) {
+                return sendJson(res, 403, { error: 'Invalid PIN' });
+              }
+              delete storedConfig.workspaces[wsIdStr];
+              summonedIds.delete(wsIdStr);
+              saveStoredConfig(storedConfig);
+              syncToClient();
+              return sendJson(res, 200, { ok: true, message: 'Workspace unhidden' });
+            }
+          }
+
+          // POST /api/hidden-workspaces/sync
+          if (req.method === 'POST' && url.pathname === '/api/hidden-workspaces/sync') {
+            syncToClient();
+            return sendJson(res, 200, { ok: true, message: 'Synced to client' });
           }
 
           sendJson(res, 404, { error: 'Not found' });
         } catch (err) {
+          logger.error('API Error:', err);
           sendJson(res, 500, { error: err.message });
         }
       }
-    });
+    }), 'hidden-workspaces: web route /api/hidden-workspaces');
+  }
+
+  // 5. 注册管理命令
+  if (ctx.commands && typeof ctx.commands.register === 'function') {
+    ctx.effect(() => ctx.commands.register({
+      name: 'summon-workspaces',
+      description: '手动唤出所有已隐匿的工作区',
+      async handler() {
+        const count = Object.keys(storedConfig.workspaces).length;
+        for (const id of Object.keys(storedConfig.workspaces)) {
+          summonedIds.add(id);
+        }
+        syncToClient();
+        return { kind: 'success', text: `已手动唤出 ${count} 个隐匿工作区。` };
+      }
+    }), 'hidden-workspaces: command summon-workspaces');
+
+    ctx.effect(() => ctx.commands.register({
+      name: 'reshide-workspaces',
+      description: '立即重新隐匿所有已唤出的工作区',
+      async handler() {
+        summonedIds.clear();
+        syncToClient();
+        return { kind: 'success', text: '已重新隐匿所有隐私工作区，检索与视图已完全隔离。' };
+      }
+    }), 'hidden-workspaces: command reshide-workspaces');
   }
 }
 export default { name, inject, apply };
