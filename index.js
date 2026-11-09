@@ -99,15 +99,16 @@ export function apply(ctx) {
   }
 
   /**
-   * 核心广播：向所有连接的前端推送最新的工作区 Baseline 与 Order，
-   * 触发 DSH 侧边栏立即剔除隐匿项或恢复显示项，彻底告别整页重载。
+   * 核心广播：严格通过 ctx.workspaceController.feed.baseline() 获取当前合法的工作区投影，
+   * 并利用 feed.publish({ type: 'replace' }) 向前端实时广播，侧边栏瞬间响应。
    */
   function syncToClient() {
     try {
-      if (ctx.workspaceController?.feed && typeof ctx.workspaceController.feed.publish === 'function') {
-        const baseline = ctx.workspaceController.baseline();
-        ctx.workspaceController.feed.publish({ type: 'replace', value: baseline });
-        ctx.workspaceController.feed.publish({
+      const feed = ctx.workspaceController?.feed;
+      if (feed && typeof feed.publish === 'function' && typeof feed.baseline === 'function') {
+        const baseline = feed.baseline();
+        feed.publish({ type: 'replace', value: baseline });
+        feed.publish({
           type: 'order',
           workspaceIds: baseline.items.map(w => w.workspaceId)
         });
@@ -159,23 +160,6 @@ export function apply(ctx) {
     }, 'hidden-workspaces: restore workspaceRegistry.list');
   }
 
-  if (ctx.workspaceController && typeof ctx.workspaceController.baseline === 'function') {
-    const origBaseline = ctx.workspaceController.baseline;
-    ctx.workspaceController.baseline = function() {
-      const base = origBaseline.call(this);
-      if (base && Array.isArray(base.items)) {
-        return {
-          ...base,
-          items: base.items.filter(item => !isEffectivelyHidden(String(item.workspaceId), item.path))
-        };
-      }
-      return base;
-    };
-    ctx.effect(() => () => {
-      ctx.workspaceController.baseline = origBaseline;
-    }, 'hidden-workspaces: restore workspaceController.baseline');
-  }
-
   // 3. Agent 工具守卫
   if (ctx.tools && typeof ctx.tools.guard === 'function') {
     ctx.effect(() => ctx.tools.guard((exec) => {
@@ -221,14 +205,7 @@ export function apply(ctx) {
           // GET /api/hidden-workspaces/list
           if (req.method === 'GET' && url.pathname === '/api/hidden-workspaces/list') {
             let allEntities = [];
-            if (originalWorkspaceList && ctx.workspaceRegistry) {
-              allEntities = originalWorkspaceList.call(ctx.workspaceRegistry).map(entity => ({
-                id: String(entity.id),
-                title: entity.title,
-                path: entity.path
-              }));
-            }
-            if (allEntities.length === 0 && ctx.workspaceRegistry?.entities) {
+            if (ctx.workspaceRegistry?.entities) {
               for (const entity of ctx.workspaceRegistry.entities.values()) {
                 allEntities.push({
                   id: String(entity.id),
@@ -236,6 +213,13 @@ export function apply(ctx) {
                   path: entity.path
                 });
               }
+            }
+            if (allEntities.length === 0 && originalWorkspaceList && ctx.workspaceRegistry) {
+              allEntities = originalWorkspaceList.call(ctx.workspaceRegistry).map(entity => ({
+                id: String(entity.id),
+                title: entity.title,
+                path: entity.path
+              }));
             }
             const hiddenList = Object.values(storedConfig.workspaces).map(w => ({
               id: w.id,
@@ -257,8 +241,8 @@ export function apply(ctx) {
             if (workspaceId) {
               const wsIdStr = String(workspaceId);
               let entity = null;
-              if (originalWorkspaceList && ctx.workspaceRegistry) {
-                entity = originalWorkspaceList.call(ctx.workspaceRegistry).find(w => String(w.id) === wsIdStr);
+              if (ctx.workspaceRegistry?.entities) {
+                entity = ctx.workspaceRegistry.entities.get(wsIdStr);
               }
               if (!entity && ctx.workspaceRegistry?.get) {
                 entity = ctx.workspaceRegistry.get(wsIdStr);

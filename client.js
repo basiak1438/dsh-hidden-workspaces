@@ -4,6 +4,9 @@ window.__ModuleLoader__.load({
     const React = require('react');
     const h = React.createElement;
 
+    // 共享客户端上下文
+    let clientCtx = null;
+
     // 矢量图标：隐蔽之眼 / 隔离锁
     function ShieldEyeIcon(props) {
       const size = props?.size || 16;
@@ -119,6 +122,12 @@ window.__ModuleLoader__.load({
 
       if (!isOpen) return null;
 
+      // 辅助刷新本地客户端会话与工作区存储
+      const triggerClientRefresh = () => {
+        try { clientCtx?.get?.('sessions')?.refresh?.(); } catch (_) {}
+        try { clientCtx?.sessions?.refresh?.(); } catch (_) {}
+      };
+
       // 隐藏工作区
       const handleHide = async () => {
         if (!selectedWsId) return;
@@ -133,6 +142,7 @@ window.__ModuleLoader__.load({
           if (res.ok) {
             setPinDraft('');
             setMessage({ type: 'success', text: '工作区已成功隐匿！检索与侧边栏已全面隔离。' });
+            triggerClientRefresh();
             await fetchData();
           } else {
             const err = await res.json();
@@ -159,6 +169,7 @@ window.__ModuleLoader__.load({
             setPromptPinWsId(null);
             setInputPin('');
             setMessage({ type: 'success', text: '已手动唤出！该工作区已临时解除隔离。' });
+            triggerClientRefresh();
             await fetchData();
           } else {
             const err = await res.json();
@@ -183,6 +194,7 @@ window.__ModuleLoader__.load({
           });
           if (res.ok) {
             setMessage({ type: 'success', text: '已重新隐匿并生效隔离。' });
+            triggerClientRefresh();
             await fetchData();
           }
         } catch (err) {
@@ -206,6 +218,7 @@ window.__ModuleLoader__.load({
             setPromptPinWsId(null);
             setInputPin('');
             setMessage({ type: 'success', text: '已彻底解除隐匿，恢复为普通工作区。' });
+            triggerClientRefresh();
             await fetchData();
           } else {
             const err = await res.json();
@@ -608,6 +621,7 @@ window.__ModuleLoader__.load({
                   try {
                     await fetch('/api/hidden-workspaces/sync', { method: 'POST' });
                   } catch (_) {}
+                  triggerClientRefresh();
                   await fetchData();
                   setMessage({ type: 'success', text: '已同步侧边栏与弹窗列表至最新状态！' });
                 },
@@ -646,6 +660,7 @@ window.__ModuleLoader__.load({
     return {
       inject: ['slots'],
       apply(ctx) {
+        clientCtx = ctx;
         // 1. 注册侧边栏底部唤出按钮
         ctx.slots.inject('sidebar.footer.action', () => ctx.slots.register({
           name: 'sidebar.footer.action',
