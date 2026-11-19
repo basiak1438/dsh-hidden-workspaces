@@ -3,6 +3,8 @@ window.__ModuleLoader__.load({
   factory(require) {
     const React = require('react');
     const h = React.createElement;
+    // 官方 UI 原语：Button / Tooltip，与"远程控制""重启应用"共用同一套几何与交互
+    const Primitives = require('@deepseek-ai/dsh-client-ui-primitives');
 
     // 共享客户端上下文
     let clientCtx = null;
@@ -80,38 +82,53 @@ window.__ModuleLoader__.load({
       ]);
     }
 
-    // 侧边栏底部唤出按钮
-    function SidebarTriggerButton() {
-      return h('button', {
-        type: 'button',
-        title: '工作区隐身与检索管理 (Ctrl+Shift+H)',
-        'aria-label': '工作区隐身与检索管理',
-        onClick: () => {
-          window.dispatchEvent(new CustomEvent('dsh:toggle-hidden-workspaces'));
-        },
-        style: {
-          width: '28px',
-          height: '28px',
-          border: 'none',
-          background: 'transparent',
-          borderRadius: 'var(--dsw-radius-sm, 4px)',
-          color: 'var(--dsw-alias-label-secondary, #9aa0a6)',
-          cursor: 'pointer',
-          display: 'inline-flex',
-          alignItems: 'center',
-          justifyContent: 'center',
-          padding: 0,
-          transition: 'all 0.15s ease'
-        },
-        onMouseEnter: (e) => {
-          e.currentTarget.style.background = 'var(--dsw-alias-interactive-bg-hover, rgba(255,255,255,0.08))';
-          e.currentTarget.style.color = 'var(--dsw-alias-label-primary, #ffffff)';
-        },
-        onMouseLeave: (e) => {
-          e.currentTarget.style.background = 'transparent';
-          e.currentTarget.style.color = 'var(--dsw-alias-label-secondary, #9aa0a6)';
-        }
-      }, h(ShieldEyeIcon, { size: 16 }));
+    // 侧边栏底部唤出按钮：完全复刻"远程控制"的官方渲染范式
+    // 接收 slot 传入的 wide，展开态为整行按钮，折叠 rail 态为圆形图标 + Tooltip
+    function SidebarTriggerButton({ wide }) {
+      const Button = Primitives?.Button;
+      const Tooltip = Primitives?.Tooltip;
+      const label = '工作区隐身';
+      const openPanel = () => {
+        window.dispatchEvent(new CustomEvent('dsh:toggle-hidden-workspaces'));
+      };
+
+      // 若官方原语不可用则降级为手写按钮，但仍保持官方几何
+      if (!Button) {
+        return h('span', {
+          className: 'dshw-trigger' + (wide ? '' : ' dshw-rail'),
+          style: { width: wide ? 'calc(100% + 4px)' : '36px', margin: wide ? '4px -2px' : '8px 0 10px', display: 'flex' }
+        }, h('button', {
+          type: 'button',
+          title: label,
+          'aria-label': label,
+          onClick: openPanel,
+          className: 'dshw-button',
+          style: {
+            width: '100%', height: wide ? '42px' : '36px', border: 'none',
+            borderRadius: wide ? '12px' : '50%', justifyContent: wide ? 'flex-start' : 'center',
+            gap: '8px', padding: wide ? '0 10px 0 8px' : 0, display: 'flex', alignItems: 'center',
+            background: 'transparent', color: 'var(--dsw-alias-label-primary, #fff)',
+            cursor: 'pointer', font: 'var(--dsw-font-s-14)'
+          }
+        }, h(ShieldEyeIcon, { size: 16 }), wide ? h('span', { className: 'dshw-label' }, label) : null));
+      }
+
+      const trigger = h(Button, {
+        variant: 'ghost',
+        className: 'dshw-button',
+        icon: h(ShieldEyeIcon, { size: 16 }),
+        'aria-label': label,
+        'aria-haspopup': 'dialog',
+        onClick: openPanel
+      }, wide ? h('span', { className: 'dshw-label' }, label) : null);
+
+      return h('span', {
+        className: 'dshw-trigger' + (wide ? '' : ' dshw-rail')
+      }, wide ? trigger : h(Tooltip ? Tooltip : 'span', {
+        label,
+        disabled: false,
+        delayMs: 500
+      }, trigger));
     }
 
     // 主管理弹窗组件（注册在 shell.overlay）
@@ -760,11 +777,29 @@ window.__ModuleLoader__.load({
       ]);
     }
 
+    // 入口按钮样式：完全复刻"远程控制"的官方 trigger/rail/button 几何
+    const ENTRY_CSS = `
+.dshw-trigger { width: calc(100% + 4px); min-width: 0; margin: 4px -2px; display: flex; }
+.dshw-trigger .dshw-button { width: 100%; height: 42px; font: var(--dsw-font-s-14); border-radius: 12px; justify-content: flex-start; gap: 8px; padding: 0 10px 0 8px; }
+.dshw-rail { width: 36px; margin: 8px 0 10px; }
+.dshw-rail .dshw-button { border-radius: 50%; justify-content: center; height: 36px; padding: 0; }
+.dshw-label { white-space: nowrap; text-overflow: ellipsis; overflow: hidden; }
+`;
+
     // 导出 Cordis Client Half 插件
     return {
       inject: ['slots'],
       apply(ctx) {
         clientCtx = ctx;
+
+        // 注入入口按钮样式，随插件卸载自动清理
+        ctx.effect(() => {
+          const styleEl = document.createElement('style');
+          styleEl.id = 'dsh-hidden-workspaces-entry-style';
+          styleEl.textContent = ENTRY_CSS;
+          document.head.appendChild(styleEl);
+          return () => { styleEl.remove(); };
+        }, 'hidden-workspaces: entry style');
 
         // 启动时立即获取隐匿配置，秒级激活全局 DOM 护盾
         fetch('/api/hidden-workspaces/list')
